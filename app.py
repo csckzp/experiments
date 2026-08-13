@@ -1,35 +1,29 @@
-import os
 import json
 import time
-from typing import List, Dict, Tuple, Optional
+from typing import List, Tuple
 from pydantic import BaseModel, Field
 import gradio as gr
 
-# LangChain Imports
-try:
-    from langchain_ollama import ChatOllama
-    from langchain_core.prompts import ChatPromptTemplate
-    from langchain_core.output_parsers import PydanticOutputParser
-    LANGCHAIN_AVAILABLE = True
-except ImportError:
-    LANGCHAIN_AVAILABLE = False
+from langchain_ollama import ChatOllama
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import PydanticOutputParser
 
 from data_loader import MAJORS_DATA, CLUBS_DATA, get_majors_summary, get_clubs_summary
 
 # ==========================================
-# 1. PYDANTIC SCHEMAS FOR AGENT CHAIN
+# 1. PYDANTIC SCHEMAS FOR AGENT PIPELINE
 # ==========================================
 
 class StudentProfile(BaseModel):
     primary_focus: str = Field(description="Main academic or personal focus area")
     secondary_interests: List[str] = Field(description="List of secondary hobbies or topics")
-    core_values: List[str] = Field(description="Key personal values or drivers (e.g. innovation, service, leadership)")
-    career_aspirations: str = Field(description="Long-term career or dream project goal")
+    core_values: List[str] = Field(description="Key personal values or drivers")
+    career_aspirations: str = Field(description="Long-term career or project goal")
 
 class MajorMatch(BaseModel):
     major_name: str = Field(description="Name of matched major from dataset")
     category: str = Field(description="Academic category/department")
-    match_score: int = Field(description="Match confidence score between 1 and 100")
+    match_score: int = Field(description="Match confidence score (1-100)")
     rationale: str = Field(description="Why this major fits the student profile")
     recommended_courses: List[str] = Field(description="Sample course highlights")
 
@@ -39,7 +33,7 @@ class MajorMatchList(BaseModel):
 class ClubMatch(BaseModel):
     club_name: str = Field(description="Name of matched student organization")
     rationale: str = Field(description="Why this club fits the student profile")
-    recommended_role: str = Field(description="Suggested entry involvement role")
+    recommended_role: str = Field(description="Suggested student role")
 
 class ClubMatchList(BaseModel):
     matches: List[ClubMatch] = Field(description="Top matched student clubs")
@@ -47,36 +41,30 @@ class ClubMatchList(BaseModel):
 class CampusRoadmap(BaseModel):
     welcome_message: str = Field(description="Welcoming ambassador greeting")
     first_year_focus: str = Field(description="Year 1 foundation and discovery focus")
-    second_year_focus: str = Field(description="Year 2 leadership and deep dive focus")
-    third_year_focus: str = Field(description="Year 3 internship and real-world impact focus")
+    second_year_focus: str = Field(description="Year 2 leadership and research focus")
+    third_year_focus: str = Field(description="Year 3 internship and co-op focus")
     fourth_year_focus: str = Field(description="Year 4 senior capstone and career launch focus")
-    admissions_next_steps: List[str] = Field(description="Actionable admissions next steps for Open House attendees")
+    admissions_next_steps: List[str] = Field(description="Actionable open house next steps")
 
 # ==========================================
 # 2. LANGCHAIN AGENT FACTORY (create_agent)
 # ==========================================
 
-def create_agent(llm, system_prompt: str, pydantic_schema=None):
-    """
-    Factory function creating an LLM Agent chain using LangChain ChatPromptTemplate,
-    ChatOllama model, and optional PydanticOutputParser for structured JSON outputs.
-    """
-    if pydantic_schema and LANGCHAIN_AVAILABLE:
+def create_agent(llm: ChatOllama, system_prompt: str, pydantic_schema=None):
+    """Factory function creating a LangChain Agent chain with Pydantic output parsing."""
+    if pydantic_schema:
         parser = PydanticOutputParser(pydantic_object=pydantic_schema)
         prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt + "\n\nCRITICAL: You MUST respond strictly in valid JSON matching this format instructions:\n{format_instructions}"),
+            ("system", system_prompt + "\n\nCRITICAL: Respond strictly in valid JSON matching schema:\n{format_instructions}"),
             ("user", "{input_text}")
         ]).partial(format_instructions=parser.get_format_instructions())
-        chain = prompt | llm | parser
-    elif LANGCHAIN_AVAILABLE:
+        return prompt | llm | parser
+    else:
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_prompt),
             ("user", "{input_text}")
         ])
-        chain = prompt | llm
-    else:
-        chain = None
-    return chain
+        return prompt | llm
 
 # ==========================================
 # 3. MULTI-AGENT PIPELINE RUNNER
@@ -87,227 +75,71 @@ def run_agentic_pipeline(
     model_name: str = "gemma4:e2b",
     base_url: str = "http://localhost:11434"
 ) -> Tuple[str, str, str, str, str]:
-    """
-    Executes the 4-Agent LangChain Pipeline:
-    Agent 1 (Extractor Agent) -> Agent 2 (Major Matcher) & Agent 3 (Club Matcher) -> Agent 4 (Roadmap Synthesizer)
-    """
-    if not student_raw_input or len(student_raw_input.strip()) < 5:
-        empty_msg = "⚠️ Please provide a few sentences about your interests, hobbies, or career goals."
-        return empty_msg, "{}", "[]", "[]", "Log trace idle."
+    if not student_raw_input.strip():
+        return "⚠️ Please enter your interests.", "{}", "[]", "[]", "Log trace idle."
 
     start_time = time.time()
-    telemetry_logs = []
-    telemetry_logs.append(f"⚙️ Target LLM Model: '{model_name}' @ '{base_url}'")
-
-    # Initialize LangChain ChatOllama LLM Instance
-    llm = None
-    if LANGCHAIN_AVAILABLE:
-        try:
-            llm = ChatOllama(
-                model=model_name,
-                base_url=base_url,
-                temperature=0.2
-            )
-            telemetry_logs.append("✅ LangChain & ChatOllama Client initialized successfully.")
-        except Exception as e:
-            telemetry_logs.append(f"⚠️ ChatOllama initialization notice: {e}")
-
-    # ----------------------------------------------------
-    # AGENT 1: Interest Extractor Agent
-    # ----------------------------------------------------
-    telemetry_logs.append("🚀 [Agent 1] Invoking Extractor Agent...")
-    extractor_prompt = (
-        "You are an Admissions Counselor Agent specializing in analyzing student interests, hobbies, values, "
-        "and career aspirations from raw student descriptions."
-    )
-    extractor_agent = create_agent(llm, extractor_prompt, pydantic_schema=StudentProfile)
     
-    profile: Optional[StudentProfile] = None
-    if extractor_agent and llm:
-        try:
-            profile = extractor_agent.invoke({"input_text": student_raw_input})
-            telemetry_logs.append("✅ [Agent 1] Extractor Agent successfully generated StudentProfile via Ollama LLM.")
-        except Exception as err:
-            telemetry_logs.append(f"⚠️ [Agent 1] LLM call fell back to heuristic parser ({err})")
-            profile = fallback_extract_profile(student_raw_input)
-    else:
-        profile = fallback_extract_profile(student_raw_input)
-        telemetry_logs.append("ℹ️ [Agent 1] Using heuristic parser (Ollama offline/not reachable).")
-
+    # Initialize ChatOllama LLM
+    llm = ChatOllama(model=model_name, base_url=base_url, temperature=0.2)
+    
+    # --- AGENT 1: Interest Extractor Agent ---
+    extractor_agent = create_agent(
+        llm,
+        "You are an Admissions Counselor Agent. Extract structured attributes from raw student prose.",
+        pydantic_schema=StudentProfile
+    )
+    profile: StudentProfile = extractor_agent.invoke({"input_text": student_raw_input})
     agent1_json = json.dumps(profile.dict(), indent=2)
-
-    # ----------------------------------------------------
-    # AGENT 2: Major Matcher Agent
-    # ----------------------------------------------------
-    telemetry_logs.append("🚀 [Agent 2] Invoking Major Matcher Agent against majors.html dataset...")
+    
+    # --- AGENT 2: Major Matcher Agent ---
     majors_context = get_majors_summary(limit=40)
-    major_prompt = (
-        "You are an Academic Program Matching Agent. Given the student profile, analyze the available university majors "
-        "below and select the top 2 to 3 most relevant majors with rationale and sample course highlights.\n\n"
-        f"Available Majors Dataset:\n{majors_context}"
+    major_agent = create_agent(
+        llm,
+        f"You are an Academic Program Matching Agent. Select top 2-3 majors from dataset:\n{majors_context}",
+        pydantic_schema=MajorMatchList
     )
-    major_agent = create_agent(llm, major_prompt, pydantic_schema=MajorMatchList)
-    
-    matched_majors: List[MajorMatch] = []
-    if major_agent and llm:
-        try:
-            result = major_agent.invoke({"input_text": agent1_json})
-            matched_majors = result.matches
-            telemetry_logs.append(f"✅ [Agent 2] Major Matcher Agent selected {len(matched_majors)} majors via LLM.")
-        except Exception as err:
-            telemetry_logs.append(f"⚠️ [Agent 2] LLM call fell back to dataset filter ({err})")
-            matched_majors = fallback_match_majors(profile, MAJORS_DATA)
-    else:
-        matched_majors = fallback_match_majors(profile, MAJORS_DATA)
-        telemetry_logs.append(f"ℹ️ [Agent 2] Matched {len(matched_majors)} majors from dataset.")
-
+    matched_majors_res: MajorMatchList = major_agent.invoke({"input_text": agent1_json})
+    matched_majors = matched_majors_res.matches
     agent2_json = json.dumps([m.dict() for m in matched_majors], indent=2)
-
-    # ----------------------------------------------------
-    # AGENT 3: Club Matcher Agent
-    # ----------------------------------------------------
-    telemetry_logs.append("🚀 [Agent 3] Invoking Club Matcher Agent against clubs.html dataset...")
+    
+    # --- AGENT 3: Club Matcher Agent ---
     clubs_context = get_clubs_summary(limit=40)
-    club_prompt = (
-        "You are a Campus Life & Student Organization Matching Agent. Given the student profile, analyze the available clubs "
-        "below and select the top 2 to 3 most engaging campus organizations with rationale and suggested student role.\n\n"
-        f"Available Student Clubs Dataset:\n{clubs_context}"
+    club_agent = create_agent(
+        llm,
+        f"You are a Campus Life Matching Agent. Select top 2-3 student clubs from dataset:\n{clubs_context}",
+        pydantic_schema=ClubMatchList
     )
-    club_agent = create_agent(llm, club_prompt, pydantic_schema=ClubMatchList)
-    
-    matched_clubs: List[ClubMatch] = []
-    if club_agent and llm:
-        try:
-            result = club_agent.invoke({"input_text": agent1_json})
-            matched_clubs = result.matches
-            telemetry_logs.append(f"✅ [Agent 3] Club Matcher Agent selected {len(matched_clubs)} clubs via LLM.")
-        except Exception as err:
-            telemetry_logs.append(f"⚠️ [Agent 3] LLM call fell back to dataset filter ({err})")
-            matched_clubs = fallback_match_clubs(profile, CLUBS_DATA)
-    else:
-        matched_clubs = fallback_match_clubs(profile, CLUBS_DATA)
-        telemetry_logs.append(f"ℹ️ [Agent 3] Matched {len(matched_clubs)} campus clubs from dataset.")
-
+    matched_clubs_res: ClubMatchList = club_agent.invoke({"input_text": agent1_json})
+    matched_clubs = matched_clubs_res.matches
     agent3_json = json.dumps([c.dict() for c in matched_clubs], indent=2)
-
-    # ----------------------------------------------------
-    # AGENT 4: Roadmap Synthesizer Agent
-    # ----------------------------------------------------
-    telemetry_logs.append("🚀 [Agent 4] Invoking Roadmap Synthesizer Agent...")
-    synthesizer_prompt = (
-        "You are an Admissions Ambassador Synthesizer Agent. Combine the student profile, matched majors, and matched clubs "
-        "into a comprehensive 4-year campus experience preview and actionable open house next steps."
-    )
-    synthesizer_agent = create_agent(llm, synthesizer_prompt, pydantic_schema=CampusRoadmap)
     
-    roadmap: Optional[CampusRoadmap] = None
+    # --- AGENT 4: Roadmap Synthesizer Agent ---
+    synthesizer_agent = create_agent(
+        llm,
+        "You are an Admissions Roadmap Synthesizer Agent. Combine inputs into a 4-year campus roadmap.",
+        pydantic_schema=CampusRoadmap
+    )
     synth_input = json.dumps({
         "profile": profile.dict(),
         "majors": [m.dict() for m in matched_majors],
         "clubs": [c.dict() for c in matched_clubs]
     }, indent=2)
+    roadmap: CampusRoadmap = synthesizer_agent.invoke({"input_text": synth_input})
     
-    if synthesizer_agent and llm:
-        try:
-            roadmap = synthesizer_agent.invoke({"input_text": synth_input})
-            telemetry_logs.append("✅ [Agent 4] Roadmap Synthesizer Agent generated 4-Year Preview via LLM.")
-        except Exception as err:
-            telemetry_logs.append(f"⚠️ [Agent 4] LLM call fell back to synthesizer ({err})")
-            roadmap = fallback_synthesize_roadmap(profile, matched_majors, matched_clubs)
-    else:
-        roadmap = fallback_synthesize_roadmap(profile, matched_majors, matched_clubs)
-        telemetry_logs.append("ℹ️ [Agent 4] Synthesized 4-Year Experience Preview.")
-
     elapsed = round(time.time() - start_time, 2)
-    telemetry_logs.append(f"⏱️ Total Agentic Pipeline Time: {elapsed}s")
+    telemetry = (
+        f"✅ LangChain Agentic Chain Executed in {elapsed}s\n"
+        f"- Target Model: {model_name} @ {base_url}\n"
+        f"- Agent 1 (Extractor): Generated StudentProfile JSON\n"
+        f"- Agent 2 (Major Matcher): Matched {len(matched_majors)} majors from majors.html\n"
+        f"- Agent 3 (Club Matcher): Matched {len(matched_clubs)} campus clubs from clubs.html\n"
+        f"- Agent 4 (Synthesizer): Generated CampusRoadmap"
+    )
     
     markdown_output = render_roadmap_markdown(roadmap, matched_majors, matched_clubs)
-    return markdown_output, agent1_json, agent2_json, agent3_json, "\n".join(telemetry_logs)
+    return markdown_output, agent1_json, agent2_json, agent3_json, telemetry
 
-
-# ==========================================
-# 4. FALLBACK HELPERS (Ensure zero-crash operation)
-# ==========================================
-
-def fallback_extract_profile(raw_input: str) -> StudentProfile:
-    text_lower = raw_input.lower()
-    interests = []
-    if any(k in text_lower for k in ["code", "computer", "ai", "robot", "software", "tech", "game"]):
-        interests.append("Artificial Intelligence & Technology")
-    if any(k in text_lower for k in ["med", "health", "bio", "doctor", "biology"]):
-        interests.append("Healthcare & Pre-Medical Sciences")
-    if any(k in text_lower for k in ["business", "startup", "company", "finance", "market"]):
-        interests.append("Entrepreneurship & Business Innovation")
-    if any(k in text_lower for k in ["art", "design", "music", "sing", "film", "creative"]):
-        interests.append("Creative Arts & Digital Media")
-        
-    if not interests:
-        interests = ["Interdisciplinary Exploration", "Leadership"]
-        
-    return StudentProfile(
-        primary_focus=interests[0],
-        secondary_interests=interests[1:] if len(interests) > 1 else ["Community Leadership"],
-        core_values=["Innovation", "Collaboration", "Global Impact"],
-        career_aspirations=f"Aspiring leader in {interests[0]} with a drive for real-world impact."
-    )
-
-def fallback_match_majors(profile: StudentProfile, majors: List[Dict[str, str]]) -> List[MajorMatch]:
-    focus = profile.primary_focus.lower()
-    matched = []
-    for m in majors:
-        name, cat = m["name"], m["category"]
-        score = 65
-        if "tech" in focus and any(k in name.lower() for k in ["computer", "engineering", "physics", "cyber"]):
-            score += 30
-        elif "health" in focus and any(k in name.lower() for k in ["bio", "health", "chem"]):
-            score += 30
-        elif "business" in focus and any(k in name.lower() for k in ["business", "account", "bba"]):
-            score += 30
-        elif "arts" in focus and any(k in name.lower() for k in ["art", "music", "film"]):
-            score += 30
-            
-        if score > 75:
-            matched.append(MajorMatch(
-                major_name=name,
-                category=cat,
-                match_score=min(score, 98),
-                rationale=f"Directly aligns with your primary focus in {profile.primary_focus}.",
-                recommended_courses=[f"Intro to {name}", f"Advanced {cat} Project"]
-            ))
-            
-    return matched[:3] if matched else [
-        MajorMatch(major_name=majors[0]["name"], category=majors[0]["category"], match_score=92, rationale="Top foundational degree program.", recommended_courses=["Core Seminar", "Capstone Research"])
-    ]
-
-def fallback_match_clubs(profile: StudentProfile, clubs: List[Dict[str, str]]) -> List[ClubMatch]:
-    focus = profile.primary_focus.lower()
-    matched = []
-    for c in clubs:
-        combined = (c["name"] + " " + c["description"]).lower()
-        if any(k in combined for k in ["ai", "robot", "tech", "consulting", "med", "art", "music", "business"]):
-            matched.append(ClubMatch(
-                club_name=c["name"],
-                rationale=c["description"][:110] + "...",
-                recommended_role="Active Team Member / Officer"
-            ))
-    return matched[:3] if matched else [
-        ClubMatch(club_name=clubs[0]["name"], rationale=clubs[0]["description"][:110] + "...", recommended_role="Student Consultant")
-    ]
-
-def fallback_synthesize_roadmap(profile: StudentProfile, majors: List[MajorMatch], clubs: List[ClubMatch]) -> CampusRoadmap:
-    return CampusRoadmap(
-        welcome_message=f"Welcome to Hofstra University! Based on your focus in **{profile.primary_focus}**, our LangChain agent pipeline has synthesized your personalized 4-year campus roadmap.",
-        first_year_focus=f"Take core foundational courses in **{majors[0].major_name if majors else 'your major'}** and join **{clubs[0].club_name if clubs else 'campus clubs'}** during Fall Common Hour.",
-        second_year_focus=f"Engage in undergraduate research, run for committee leadership roles, and connect with faculty mentors.",
-        third_year_focus=f"Participate in the Hofstra Career & Internship Fair, complete industry co-ops, and attend NYC networking forums.",
-        fourth_year_focus=f"Complete your Senior Capstone Project, lead student organization initiatives, and prepare for graduate launch.",
-        admissions_next_steps=[
-            "📅 **Schedule a Campus Tour**: Explore our laboratories, library, and student center.",
-            "💬 **Meet Faculty Members**: Talk with department professors during today's Academic Fair.",
-            "📝 **Submit Your Application**: Complete the Common App prior to the Early Action deadline.",
-            "🎁 **Consult Financial Aid**: Visit the Admission Center for merit scholarship guidance."
-        ]
-    )
 
 def render_roadmap_markdown(roadmap: CampusRoadmap, majors: List[MajorMatch], clubs: List[ClubMatch]) -> str:
     md = []
@@ -343,7 +175,7 @@ def render_roadmap_markdown(roadmap: CampusRoadmap, majors: List[MajorMatch], cl
 
 
 # ==========================================
-# 5. GRADIO USER INTERFACE
+# 4. GRADIO USER INTERFACE
 # ==========================================
 
 custom_css = """
@@ -372,7 +204,7 @@ custom_css = """
 """
 
 def create_gradio_app():
-    with gr.Blocks(title="Smart Major & Campus Life Matcher (LangChain + Ollama)", css=custom_css) as app:
+    with gr.Blocks(title="Smart Major & Campus Life Matcher (LangChain)", css=custom_css) as app:
         
         # Header Banner
         gr.HTML("""
@@ -387,7 +219,7 @@ def create_gradio_app():
             with gr.Column(scale=5):
                 gr.Markdown("### ⚙️ LLM & Agent Config")
                 with gr.Row():
-                    model_input = gr.Textbox(label="Ollama Model", value="gemma4:e2b", placeholder="e.g. gemma4:e2b, gemma2:2b, llama3.1")
+                    model_input = gr.Textbox(label="Ollama Model", value="gemma4:e2b")
                     url_input = gr.Textbox(label="Ollama Base URL", value="http://localhost:11434")
 
                 gr.Markdown("### 📝 Tell Us About Yourself")
